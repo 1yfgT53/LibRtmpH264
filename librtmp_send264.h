@@ -57,10 +57,11 @@ enum
  * 初始化并连接到服务器
  *
  * @param url 服务器上对应webapp的地址
- *					
+ * @isOpenPrintLog 是否打印日志
+ * @logType 日志类型
  * @成功则返回1 , 失败则返回0
  */ 
-int RTMP264_Connect(const char* url, RTMP** ppRtmp);
+int RTMP264_Connect(const char* url, RTMP** ppRtmp, int isOpenPrintLog, int logType);
     
 
 /**

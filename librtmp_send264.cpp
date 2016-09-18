@@ -18,6 +18,7 @@
 #include <stdlib.h>
  
 #include "librtmp_send264.h"
+#include "librtmp\log.h"
 
 #ifdef WIN32     
 #include <windows.h>  
@@ -126,6 +127,33 @@ char * put_amf_double( char *c, double d )
 	return c+8;    
 }  
 
+void librtmpLogCallback(int level, const char *format, va_list vl)
+{
+	char* ansiStr = new char[1024];
+	TCHAR* logStr = new TCHAR[1024];
+
+	/*if (level > RTMP_LOGERROR)
+		return;*/
+
+	vsnprintf(ansiStr, sizeof(ansiStr) - 1, format, vl);
+	ansiStr[sizeof(ansiStr) - 1] = 0;
+
+	//MultiByteToWideChar(CP_UTF8, 0, ansiStr, -1, logStr, _countof(logStr) - 1);
+
+	
+	if (level == RTMP_LOGERROR)
+	{
+		printf("librtmp Error: %s \n", ansiStr);
+	}
+	else
+	{
+		printf("librtmp log: %s \n", ansiStr);
+	}
+
+	delete[] ansiStr;
+	delete[] logStr;
+}
+
 
 RTMP* m_pRtmp;  
 RTMPMetadata metaData;
@@ -135,15 +163,51 @@ RTMPMetadata metaData;
  * 初始化并连接到服务器
  *
  * @param url 服务器上对应webapp的地址
- *					
+ * @isOpenPrintLog 是否打印日志  0不打印   1打印
+ * @logType 日志类型					
  * @成功则返回1 , 失败则返回0
  */ 
-int RTMP264_Connect(const char* url, RTMP** ppRtmp)
+int RTMP264_Connect(const char* url, RTMP** ppRtmp, int isOpenPrintLog, int logType)
 {  
 	InitSockets();  
 
 	m_pRtmp = RTMP_Alloc();
 	RTMP_Init(m_pRtmp);
+	m_pRtmp->Link.lFlags |= RTMP_LF_LIVE;
+
+	if (isOpenPrintLog > 0)
+	{
+		RTMP_LogSetCallback(librtmpLogCallback);
+		switch (logType)
+		{
+		case 0:
+			RTMP_LogSetLevel(RTMP_LOGCRIT); 
+			break;
+		case 1:
+			RTMP_LogSetLevel(RTMP_LOGERROR);
+			break;
+		case 2:
+			RTMP_LogSetLevel(RTMP_LOGWARNING);
+			break;
+		case 3:
+			RTMP_LogSetLevel(RTMP_LOGINFO);
+			break;
+		case 4:
+			RTMP_LogSetLevel(RTMP_LOGDEBUG);
+			break;
+		case 5:
+			RTMP_LogSetLevel(RTMP_LOGDEBUG2);
+			break;
+		case 6:
+			RTMP_LogSetLevel(RTMP_LOGALL);
+			break;
+		default:
+			break;
+		}
+		
+	}
+
+
 	/*设置URL*/
 	if (RTMP_SetupURL(m_pRtmp,(char*)url) == FALSE)
 	{
@@ -156,7 +220,7 @@ int RTMP264_Connect(const char* url, RTMP** ppRtmp)
 	if (RTMP_Connect(m_pRtmp, NULL) == FALSE) 
 	{
 		RTMP_Free(m_pRtmp);
-		return -2;
+		return -1;
 	} 
 
 	/*连接流*/
@@ -164,7 +228,7 @@ int RTMP264_Connect(const char* url, RTMP** ppRtmp)
 	{
 		RTMP_Close(m_pRtmp);
 		RTMP_Free(m_pRtmp);
-		return -3;
+		return -1;
 	}
 	*ppRtmp = m_pRtmp;
 	return true;  
@@ -339,8 +403,21 @@ int SendH264Packet(unsigned char *data,unsigned int size,int bIsKeyFrame,unsigne
 		body[i++] = size&0xff;
 		// NALU data   
 		memcpy(&body[i],data,size);  
-		SendVideoSpsPps(metaData.Pps,metaData.nPpsLen,metaData.Sps,metaData.nSpsLen);
-	}else{  
+		int bRetSpsPps = SendVideoSpsPps(metaData.Pps,metaData.nPpsLen,metaData.Sps,metaData.nSpsLen);
+
+		int bRet = 0;
+		if (bRetSpsPps > 0)
+		{
+			bRet = SendPacket(RTMP_PACKET_TYPE_VIDEO, body, i + size, nTimeStamp);
+		}
+
+		free(body);
+
+		return bRet;
+		
+	}
+	else
+	{  
 		body[i++] = 0x27;// 2:Pframe  7:AVC   
 		body[i++] = 0x01;// AVC NALU   
 		body[i++] = 0x00;  
@@ -355,13 +432,14 @@ int SendH264Packet(unsigned char *data,unsigned int size,int bIsKeyFrame,unsigne
 		body[i++] = size&0xff;
 		// NALU data   
 		memcpy(&body[i],data,size);  
+
+
+		int bRet = SendPacket(RTMP_PACKET_TYPE_VIDEO, body, i + size, nTimeStamp);
+
+		free(body);
+
+		return bRet;
 	}  
 	
-
-	int bRet = SendPacket(RTMP_PACKET_TYPE_VIDEO,body,i+size,nTimeStamp);  
-
-	free(body);  
-
-	return bRet;  
 } 
 

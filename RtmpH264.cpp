@@ -5,17 +5,11 @@
 #include "RtmpH264.h"
 #include "objbase.h"
 
-MP4FileHandle hMp4File;
-MP4TrackId videoTrackId;
-MP4TrackId audioTrackId;
+
 char* audioConfig = NULL;
 long audioConfigLen = 0;
 
 void stream_stop(RTMPMOD_SPublishObj* psObj);
-
-long InitMp4(char* fileName);
-void CloseMp4File();
-void WriteSpsPPs(int width, int height, int fps, int audiochannel, int audioSample, char* spsData, int spsLen, char* ppsData, int ppsLen);
 
 
 x264_t * h = NULL;//对象句柄，
@@ -32,6 +26,9 @@ int pps_len;
 unsigned char * sps = 0;
 int sps_len;
 
+RtmpH264* pRtmpH264 = NULL;
+
+
 // Class constructor
 RtmpH264::RtmpH264() : m_isCreatePublish(false),m_SwsContext(NULL)
 {
@@ -44,13 +41,15 @@ RtmpH264::RtmpH264() : m_isCreatePublish(false),m_SwsContext(NULL)
 	rtmp_PublishObj.nPcmAudioLen = 0;
 	rtmp_PublishObj.szAacAudio = 0;
 	rtmp_PublishObj.nAacAudioSize = 0;
+	
 }
 
 //创建推送连接
-int RtmpH264::CreatePublish(char* url, int outChunkSize)
+int RtmpH264::CreatePublish(char* url, int outChunkSize, int isOpenPrintLog, int logType)
 {
 	int rResult = 0;
-	rResult = RTMP264_Connect(url, &rtmp_PublishObj.rtmp);
+	rResult = RTMP264_Connect(url, &rtmp_PublishObj.rtmp, isOpenPrintLog, logType);
+
 	if (rResult == 1)
 	{
 		m_isCreatePublish = true;
@@ -94,10 +93,18 @@ void RtmpH264::DeletePublish()
 	{
 		RTMP264_Close();
 	}
+
+
 	m_isCreatePublish = false;
 }
 
-//初始化视频编码器
+/*初始化视频编码器
+<param name = "width">视频宽度< / param>
+*<param name = "height">视频高度< / param>
+*<param name = "fps">帧率< / param>
+*<param name = "bitrate">比特率< / param>
+*<param name = "bConstantsBitrate"> 是否恒定码率 < / param>
+*/
 int RtmpH264::InitVideoParams(unsigned long width, unsigned long height, unsigned long fps, unsigned long bitrate, bool bConstantsBitrate = false)
 {
 	m_width = width;//宽，根据实际情况改
@@ -119,13 +126,12 @@ int RtmpH264::InitVideoParams(unsigned long width, unsigned long height, unsigne
 	param.i_width = m_width;
 	param.i_height = m_height;
 	param.i_frame_total = 0; //* 编码总帧数.不知道用0.
-	param.i_keyint_min = 5;//关键帧最小间隔
+	param.i_keyint_min = 0;//关键帧最小间隔
 	param.i_keyint_max = (int)fps*2;//关键帧最大间隔
 	param.b_annexb = 1;//1前面为0x00000001,0为nal长度
 	param.b_repeat_headers = 0;//关键帧前面是否放sps跟pps帧，0 否 1，放	
 
-	//param.vui.i_sar_width = m_width;
-	//param.vui.i_sar_height = m_height;
+
 	param.i_csp = X264_CSP_I420;
 
 
@@ -139,17 +145,15 @@ int RtmpH264::InitVideoParams(unsigned long width, unsigned long height, unsigne
 	param.rc.i_lookahead = 0;
 	param.rc.i_bitrate = (int)m_bitRate; //* 码率(比特率,单位Kbps)
 
-	if(bConstantsBitrate)
+	if(!bConstantsBitrate)
 	{
-		param.rc.f_rf_constant = 10;	//rc.f_rf_constant是实际质量，越大图像越花，越小越清晰。
-		param.rc.f_rf_constant_max = 35;
 		param.rc.i_rc_method = X264_RC_ABR;//参数i_rc_method表示码率控制，CQP(恒定质量)，CRF(恒定码率)，ABR(平均码率)
-		param.rc.i_vbv_max_bitrate = (int)m_bitRate*1.1; // 平均码率模式下，最大瞬时码率，默认0(与-B设置相同)
+		param.rc.i_vbv_max_bitrate = (int)m_bitRate*1; // 平均码率模式下，最大瞬时码率，默认0(与-B设置相同)
 	}
 	else
 	{
 		param.rc.b_filler = 1;
-		param.rc.f_rf_constant = 0.0f;;	//rc.f_rf_constant是实际质量，越大图像越花，越小越清晰。
+		
 		param.rc.i_rc_method = X264_RC_ABR;//参数i_rc_method表示码率控制，CQP(恒定质量)，CRF(恒定码率)，ABR(平均码率)
 		param.rc.i_vbv_max_bitrate = m_bitRate; // 平均码率模式下，最大瞬时码率，默认0(与-B设置相同)
 		param.rc.i_vbv_buffer_size  = m_bitRate; //vbv-bufsize
@@ -166,6 +170,7 @@ int RtmpH264::InitVideoParams(unsigned long width, unsigned long height, unsigne
 
 	x264_picture_init(&m_picOutput);//初始化图片信息
 	x264_picture_alloc(&m_picInput, X264_CSP_I420, m_width, m_height);//图片按I420格式分配空间，最后要x264_picture_clean 
+	m_picInput.i_pts = 0;
 
 	i_nal = 0;
 	x264_encoder_headers(h, &nal_t, &i_nal);
@@ -230,30 +235,37 @@ void RtmpH264::FreeEncodeParams()
 
 	stream_stop(&rtmp_PublishObj);
 	
+	//DeleteCriticalSection(&m_Cs);
+
 }
 
-//图片编码发送
+/**
+* 图片编码发送
+*
+* @成功则返回 1 , 失败则返回0
+*/
 int RtmpH264::SendScreenCapture(BYTE * frame, unsigned long Stride, unsigned long StrideHeight, unsigned long timespan)
 {
+	
+	//int nDataLen = Stride * StrideHeight;
 
-	int nDataLen = Stride * StrideHeight;
-
-	uint8_t * rgb_buff = new uint8_t[nDataLen];
-	memcpy(rgb_buff, frame, nDataLen);
+	/*uint8_t * rgb_buff = new uint8_t[nDataLen];
+	memcpy(rgb_buff, frame, nDataLen);*/
 
 	
 	//下面的位图转完是倒立的
-	uint8_t *rgb_src[3]= {rgb_buff, NULL, NULL};
+	uint8_t *rgb_src[3] = { frame, NULL, NULL };
 	int rgb_stride[3]={Stride, 0, 0};
 	sws_scale(m_SwsContext, rgb_src, rgb_stride, 0, m_height, m_picInput.img.plane, m_picInput.img.i_stride);
 	
-	delete[] rgb_buff;
+	//delete[] rgb_buff;
 	
 	i_nal = 0;
 	x264_encoder_encode(h, &nal_t, &i_nal, &m_picInput, &m_picOutput);	
 	m_picInput.i_pts++;//少这句的话会出现 x264 [warning]: non-strictly-monotonic PTS
 
-	int rResult = 5;
+
+	int rResult = 0;
 	for (int i = 0; i < i_nal; i++)
 	{
 		int bKeyFrame = 0;
@@ -263,158 +275,14 @@ int RtmpH264::SendScreenCapture(BYTE * frame, unsigned long Stride, unsigned lon
 			if (nal_t[i].i_type == NAL_SLICE_IDR)
 				bKeyFrame = 1;
 
-
+			//EnterCriticalSection(&m_Cs);
 			rResult = SendH264Packet(nal_t[i].p_payload + 4, nal_t[i].i_payload - 4, bKeyFrame, timespan);
+			//LeaveCriticalSection(&m_Cs);
 		}
 	}
 
 	return rResult;
 }
-
-//初始化视频编码器
-int RtmpH264::WriteVideoParams(unsigned long width, unsigned long height, unsigned long fps, unsigned long bitrate)
-{
-	m_width = width;//宽，根据实际情况改
-	m_height = height;//高
-	m_frameRate = fps;
-	m_bitRate = bitrate;
-
-	int yuvsize = m_height*m_width * 3 / 2;
-
-	x264_param_default(&param);//设置默认参数具体见common/common.c
-
-
-	//* 使用默认参数，在这里因为我的是实时网络传输，所以我使用了zerolatency的选项，使用这个选项之后就不会有delayed_frames，如果你使用的不是这样的话，还需要在编码完成之后得到缓存的编码帧  
-	x264_param_default_preset(&param, "veryfast", "zerolatency");
-
-	//* cpuFlags 
-	param.i_threads = X264_SYNC_LOOKAHEAD_AUTO;//* 取空缓冲区继续使用不死锁的保证.  
-
-	//* 视频选项
-	param.i_width = m_width;
-	param.i_height = m_height;
-	param.i_frame_total = 0; //* 编码总帧数.不知道用0.
-	param.i_keyint_min = 0;//关键帧最小间隔
-	param.i_keyint_max = fps;//关键帧最大间隔
-	param.b_annexb = 1;//1前面为0x00000001,0为nal长度
-	param.b_repeat_headers = 0;//关键帧前面是否放sps跟pps帧，0 否 1，放	
-
-	//param.vui.i_sar_width = m_width;
-	//param.vui.i_sar_height = m_height;
-	param.i_csp = X264_CSP_I420;
-
-
-	//* 流参数
-	param.i_bframe = 0;	//B帧
-	param.b_open_gop = 0;
-	param.i_bframe_pyramid = 0;
-	param.i_bframe_adaptive = X264_B_ADAPT_FAST;
-
-	//* 速率控制参数 
-	param.rc.i_lookahead = 0;
-	param.rc.i_bitrate = bitrate; //* 码率(比特率,单位Kbps)
-	param.rc.f_rf_constant = 5;	//rc.f_rf_constant是实际质量，越大图像越花，越小越清晰。
-	param.rc.f_rf_constant_max = 25;
-	param.rc.i_rc_method = X264_RC_ABR;//参数i_rc_method表示码率控制，CQP(恒定质量)，CRF(恒定码率)，ABR(平均码率)
-	param.rc.i_vbv_max_bitrate = (int)(m_bitRate*1.2); // 平均码率模式下，最大瞬时码率，默认0(与-B设置相同)
-	param.rc.i_bitrate = (int)m_bitRate;
-
-	//* muxing parameters
-	param.i_fps_den = 1; // 帧率分母
-	param.i_fps_num = fps;// 帧率分子
-	param.i_timebase_num = 1;
-	param.i_timebase_den = 1000;
-
-	//* 设置Profile.使用Baseline profile  
-	//x264_param_apply_profile(&param, x264_profile_names[0]);
-
-	h = x264_encoder_open(&param);//根据参数初始化X264级别
-
-	x264_picture_init(&m_picOutput);//初始化图片信息
-	//x264_picture_init(&m_picInput);//初始化图片信息
-	x264_picture_alloc(&m_picInput, X264_CSP_I420, m_width, m_height);//图片按I420格式分配空间，最后要x264_picture_clean 
-
-	i_nal = 0;
-	x264_encoder_headers(h, &nal_t, &i_nal);
-	if (i_nal > 0)
-	{
-		for (int i = 0; i < i_nal; i++)
-		{
-			//获取SPS数据，PPS数据
-			if (nal_t[i].i_type == NAL_SPS)
-			{
-				sps = new unsigned char[nal_t[i].i_payload - 4];
-				sps_len = nal_t[i].i_payload - 4;
-				memcpy(sps, nal_t[i].p_payload + 4, nal_t[i].i_payload - 4);
-			}
-			else if (nal_t[i].i_type == NAL_PPS)
-			{
-				pps = new unsigned char[nal_t[i].i_payload - 4];;
-				pps_len = nal_t[i].i_payload - 4;
-				memcpy(pps, nal_t[i].p_payload + 4, nal_t[i].i_payload - 4);
-			}
-		}
-
-		WriteSpsPPs(m_width, m_height, m_frameRate, m_audioChannel, m_audioSample, (char*)sps, sps_len, (char*)pps, pps_len);
-
-		m_SwsContext= sws_getContext(m_width, m_height, AV_PIX_FMT_BGR24, m_width, m_height, AV_PIX_FMT_YUV420P, SWS_BILINEAR, NULL, NULL, NULL);
-
-		return 1;
-	}
-
-	return 0;
-}
-
-unsigned long lastFrameTime = 0;
-
-//图片编码发送
-int RtmpH264::WriteScreenCapture(BYTE * frame, unsigned long Stride, unsigned long StrideHeight, unsigned long timespan)
-{
-	int nDataLen = Stride * StrideHeight;
-
-	uint8_t * rgb_buff = new uint8_t[nDataLen];
-	memcpy(rgb_buff, frame, nDataLen);
-
-	
-	//下面的位图转完是倒立的
-	uint8_t *rgb_src[3]= {rgb_buff, NULL, NULL};
-	int rgb_stride[3]={3*m_width, 0, 0};
-	sws_scale(m_SwsContext, rgb_src, rgb_stride, 0, m_height, m_picInput.img.plane, m_picInput.img.i_stride);
-	
-	delete[] rgb_buff;
-
-	i_nal = 0;
-	x264_encoder_encode(h, &nal_t, &i_nal, &m_picInput, &m_picOutput);
-	//少这句的话会出现 x264 [warning]: non-strictly-monotonic PTS
-	m_picInput.i_pts++;
-
-
-	unsigned long durationTime = (timespan - lastFrameTime)*90;
-	lastFrameTime = timespan;
-
-	int rResult = 5;
-	for (int i = 0; i < i_nal; i++)
-	{
-		int bKeyFrame = 0;
-		//获取帧数据
-		if (nal_t[i].i_type == NAL_SLICE || nal_t[i].i_type == NAL_SLICE_IDR)
-		{
-			if (nal_t[i].i_type == NAL_SLICE_IDR)
-				bKeyFrame = 1;
-
-			uint32_t* p = (uint32_t*) nal_t[i].p_payload;
-			*p = htonl(nal_t[i].i_payload - 4);//大端,去掉头部四个字节
-			if(MP4WriteSample(hMp4File, videoTrackId, (uint8_t *)nal_t[i].p_payload, nal_t[i].i_payload, durationTime, 0, 1))
-				rResult = 1;
-			else
-				rResult = 0;
-
-		}
-	}
-
-	return rResult;
-}
-
 
 #define EB_MAX(a,b)               (((a) > (b)) ? (a) : (b))
 #define EB_MIN(a,b)               (((a) < (b)) ? (a) : (b))
@@ -554,130 +422,15 @@ bool stream_init(RTMPMOD_SPublishObj* psObj, unsigned long nSampleRate, unsigned
 	// send packet
 	//assert(psObj->rtmp);
 
+	//EnterCriticalSection(&m_Cs);
 
 	RTMP_SendPacket(psObj->rtmp, &psObj->packet, true);
 
-	// success
-	return true;
-}
-
-//初始化音频编码器
-bool write_stream_init(RTMPMOD_SPublishObj* psObj, unsigned long nSampleRate, unsigned long nChannels)
-{
-	faacEncConfigurationPtr pConfiguration;
-	unsigned long			nInputSamples;
-	unsigned long			nMaxOutputBytes;
-	int						nRet;
-	char*					szPcmAudio;
-	unsigned long			nPcmAudioSize;
-	char*					szAacAudio;
-	unsigned long			nAacAudioSize;
-	unsigned char *			buf;
-	unsigned long			len;
-
-	// skip
-	if ((psObj->hEncoder) && (nSampleRate == psObj->nSampleRate) && (nChannels == psObj->nChannels))
-	{
-		return true;
-	}
-
-	// close
-	stream_stop(psObj);
-
-	// open FAAC engine
-	faacEncHandle hEncoder = faacEncOpen(nSampleRate, nChannels, &nInputSamples, &nMaxOutputBytes);
-	if (hEncoder == NULL)
-	{
-		//assert(0);
-		return false;
-	}
-
-	// set encoding configuration
-	pConfiguration = faacEncGetCurrentConfiguration(hEncoder);
-	pConfiguration->aacObjectType = LOW;
-	pConfiguration->bitRate = 32000;
-	pConfiguration->mpegVersion = MPEG4;
-	pConfiguration->allowMidside = 0;
-	pConfiguration->useTns = 0;
-	pConfiguration->useLfe = 0;
-	pConfiguration->bandWidth = 0;
-	pConfiguration->quantqual = 100;
-	pConfiguration->outputFormat = 0;
-	pConfiguration->inputFormat = (PCM_BITSIZE == 2) ? FAAC_INPUT_16BIT : FAAC_INPUT_32BIT;
-	pConfiguration->shortctl = SHORTCTL_NORMAL;
-	nRet = faacEncSetConfiguration(hEncoder, pConfiguration);
-	if (!nRet)
-	{
-		//assert(0);
-		nRet = faacEncClose(hEncoder);
-		return false;
-	}
-
-	// buffer
-	nPcmAudioSize = nInputSamples * PCM_BITSIZE * nChannels;
-	szPcmAudio = (char*)malloc(nPcmAudioSize);
-	nAacAudioSize = nMaxOutputBytes + RTMP_MAX_HEADER_SIZE + 2;
-	szAacAudio = (char*)malloc(nAacAudioSize);
-	if ((!szPcmAudio) || (!szAacAudio))
-	{
-		nRet = faacEncClose(hEncoder);
-		if (szPcmAudio)
-		{
-			free(szPcmAudio);
-		}
-		if (szAacAudio)
-		{
-			free(szAacAudio);
-		}
-		//assert(0);
-		return false;
-	}
-
-	// success
-	psObj->hEncoder = hEncoder;
-	psObj->nSampleRate = nSampleRate;
-	psObj->nChannels = nChannels;
-	psObj->nTimeDelta = (nInputSamples * 1000 / nSampleRate);
-	psObj->szPcmAudio = szPcmAudio;
-	psObj->nPcmAudioSize = nPcmAudioSize;
-	psObj->nPcmAudioLen = 0;
-	psObj->szAacAudio = szAacAudio;
-	psObj->nAacAudioSize = nAacAudioSize;
-
-	// send aac header
-	faacEncGetDecoderSpecificInfo(hEncoder, &buf, &len);
-
-	if (audioConfig)
-	{
-		free(audioConfig);
-		audioConfig = NULL;
-	}
-	audioConfig = new char[len];
-	memcpy(audioConfig, buf, len);
-	audioConfigLen = len;
-	
-
-	memcpy(psObj->szAacAudio + RTMP_MAX_HEADER_SIZE + 2, buf, len);
-	len += 2;
-	psObj->szAacAudio[RTMP_MAX_HEADER_SIZE + 0] = (char)0xAF;
-	psObj->szAacAudio[RTMP_MAX_HEADER_SIZE + 1] = (char)0x00;
-	psObj->packet.m_headerType = RTMP_PACKET_SIZE_LARGE;
-	psObj->packet.m_packetType = RTMP_PACKET_TYPE_AUDIO;
-	psObj->packet.m_hasAbsTimestamp = 0;
-	psObj->packet.m_nChannel = 0x04;
-	psObj->packet.m_nTimeStamp = psObj->nTimeStamp;
-	//psObj->packet.m_nInfoField2 = psObj->rtmp->m_stream_id;
-	psObj->packet.m_nBodySize = len;
-	psObj->packet.m_body = psObj->szAacAudio + RTMP_MAX_HEADER_SIZE;
-	psObj->packet.m_nBytesRead = 0;
-
-	// send packet
-	//assert(psObj->rtmp);
+	//LeaveCriticalSection(&m_Cs);
 
 	// success
 	return true;
 }
-
 		
 //编码后发送音频数据
 long RTMPMOD_PublishSendAudio(RTMPMOD_SPublishObj* hObj, char* szBuf, unsigned long nBufLen, unsigned long nSampleRate, unsigned long nChannels, unsigned long timespan)
@@ -744,11 +497,15 @@ long RTMPMOD_PublishSendAudio(RTMPMOD_SPublishObj* hObj, char* szBuf, unsigned l
 			psObj->packet.m_nBytesRead = 0;
 
 
+			//EnterCriticalSection(&m_Cs);
+
 			// send packet
 			if (!RTMP_SendPacket(psObj->rtmp, &psObj->packet, true))
 			{
 				return 0;
 			}
+
+			//LeaveCriticalSection(&m_Cs);
 		}
 		
 	}
@@ -758,86 +515,9 @@ long RTMPMOD_PublishSendAudio(RTMPMOD_SPublishObj* hObj, char* szBuf, unsigned l
 	return 1;
 }
 
-long RTMPMOD_WriteSendAudio(RTMPMOD_SPublishObj* hObj, char* szBuf, unsigned long nBufLen, unsigned long nSampleRate, unsigned long nChannels, unsigned long timespan)
-{
-	
-
-	RTMPMOD_SPublishObj*	psObj = (RTMPMOD_SPublishObj*)hObj;
-	unsigned long			nDone = 0;
-	unsigned long			nCopy;
-	int						nRet;
-	int						nResult;
-
-	// check
-	if ((!psObj) || (!szBuf) || (!nBufLen) || (!nSampleRate) || ((1 != nChannels) && (2 != nChannels)))
-	{
-		return 0;
-	}
-
-	// init
-	if (!write_stream_init(psObj, nSampleRate, nChannels))
-	{
-		return 0;
-	}
-
-	// encode and send
-	while (nDone < nBufLen)
-	{
-		// copy
-		nCopy = EB_MIN((nBufLen - nDone), (psObj->nPcmAudioSize - psObj->nPcmAudioLen));
-		memcpy(psObj->szPcmAudio + psObj->nPcmAudioLen, szBuf + nDone, nCopy);
-		nDone += nCopy;
-		psObj->nPcmAudioLen += nCopy;
-
-		
-
-		// ready
-		if (psObj->nPcmAudioLen == psObj->nPcmAudioSize)
-		{
-			// encode
-			nRet = faacEncEncode(psObj->hEncoder, (int*)psObj->szPcmAudio, (psObj->nPcmAudioSize / PCM_BITSIZE) / psObj->nChannels,
-				(unsigned char*)(psObj->szAacAudio + RTMP_MAX_HEADER_SIZE + 2), psObj->nAacAudioSize - RTMP_MAX_HEADER_SIZE - 2);
-			psObj->nPcmAudioLen = 0;
-			if (nRet <= 0)
-			{
-				continue;
-			}
-			psObj->nTimeStamp = timespan;
-			//psObj->nTimeStamp += psObj->nTimeDelta;
-
-			// packet
-			psObj->szAacAudio[RTMP_MAX_HEADER_SIZE + 0] = (char)0xAF;
-			psObj->szAacAudio[RTMP_MAX_HEADER_SIZE + 1] = (char)0x01;
-			psObj->packet.m_headerType = RTMP_PACKET_SIZE_MEDIUM;
-			psObj->packet.m_packetType = RTMP_PACKET_TYPE_AUDIO;
-			psObj->packet.m_hasAbsTimestamp = 0;
-			psObj->packet.m_nChannel = 0x04;
-			psObj->packet.m_nTimeStamp = psObj->nTimeStamp;
-			//psObj->packet.m_nInfoField2 = psObj->rtmp->m_stream_id;
-			psObj->packet.m_nBodySize = nRet + 2;
-			psObj->packet.m_body = psObj->szAacAudio + RTMP_MAX_HEADER_SIZE;
-			psObj->packet.m_nBytesRead = 0;
-
-			
-			if(MP4WriteSample(hMp4File, audioTrackId, (uint8_t *)(psObj->szAacAudio + RTMP_MAX_HEADER_SIZE + 2), nRet, MP4_INVALID_DURATION, 0, 1))
-				nResult = 1;
-			else
-				nResult = 0;
-		}
-		
-	}
-
-	
-
-	// success
-	return nResult;
-}
-
-
-RtmpH264* pRtmpH264 = NULL;
 
 //创建推送流连接
-long RTMP_CreatePublish(char* url,unsigned long outChunkSize)
+long RTMP_CreatePublish(char* url, unsigned long outChunkSize, int isOpenPrintLog, int logType)
 {
 	int nResult = -1;
 	if (pRtmpH264)
@@ -849,7 +529,7 @@ long RTMP_CreatePublish(char* url,unsigned long outChunkSize)
 	}
 
 	pRtmpH264 = new RtmpH264();
-	nResult = pRtmpH264->CreatePublish(url, (int)outChunkSize);
+	nResult = pRtmpH264->CreatePublish(url, (int)outChunkSize, isOpenPrintLog, logType);
 	if (nResult != 1)
 		pRtmpH264->m_isCreatePublish = false;
 
@@ -891,7 +571,7 @@ long RTMP_InitVideoParams(unsigned long width, unsigned long height, unsigned lo
 	if (nResult != 1)
 	{
 		pRtmpH264->m_isCreatePublish = false;
-		RTMP_DeletePublish();		
+		RTMP_DeletePublish();
 	}
 
 	return nResult;
@@ -923,7 +603,7 @@ long RTMP_SendScreenCapture(char * frame, unsigned long Stride, unsigned long He
 	if (nResult != 1)
 	{
 		pRtmpH264->m_isCreatePublish = false;
-		RTMP_DeletePublish();		
+		RTMP_DeletePublish();
 	}
 	
 	return nResult;
@@ -953,152 +633,8 @@ long RTMP_SendAudioFrame(char* szBuf, unsigned long nBufLen, unsigned long nSamp
 	if (nResult != 1)
 	{
 		pRtmpH264->m_isCreatePublish = false;
-		RTMP_DeletePublish();		
+		RTMP_DeletePublish();
 	}
 	
-	return nResult;
-}
-
-
-//////////////////////////////////////////////////////////////////////////////////////////////////////
-///
-///
-/////////////////////////////////////////////////////////////////////////////////////////////////////
-
-
-// 创建文件 成功返回0， 失败返回1
-long InitMp4(char* fileName)
-{
-	hMp4File = MP4CreateEx(fileName, /*MP4_DETAILS_ALL*/MP4_CREATE_64BIT_DATA);//创建mp4文件
-	if (hMp4File == MP4_INVALID_FILE_HANDLE)
-	{
-		printf("open file fialed.\n");
-		return 1;
-	}
-
-	return 0;
-}
-
-void WriteSpsPPs(int width, int height, int fps, int audiochannel, int audioSample, char* spsData, int spsLen, char* ppsData, int ppsLen)
-{
-	MP4SetTimeScale(hMp4File, 90000);
-
-	//添加h264 track    
-	videoTrackId = MP4AddH264VideoTrack(hMp4File, 90000,  MP4_INVALID_DURATION, width, height,
-		spsData[1], //sps[1] AVCProfileIndication
-		spsData[2], //sps[2] profile_compat
-		spsData[3], //sps[3] AVCLevelIndication
-		3); // 4 bytes length before each NAL unit
-
-	if (videoTrackId == MP4_INVALID_TRACK_ID)
-	{
-		printf("add video track failed.\n");
-		return;
-	}
-	MP4SetVideoProfileLevel(hMp4File, 0x7f);
-
-	//添加aac音频
-	if(audiochannel == 1)
-		audioTrackId = MP4AddAudioTrack(hMp4File, audioSample*2, 2048, MP4_MPEG4_AUDIO_TYPE);
-	else
-		audioTrackId = MP4AddAudioTrack(hMp4File, audioSample, 2048, MP4_MPEG4_AUDIO_TYPE);
-	if (audioTrackId == MP4_INVALID_TRACK_ID)
-	{
-		printf("add audio track failed.\n");
-		return;
-	}
-	MP4SetAudioProfileLevel(hMp4File, 0x2);
-
-	// write sps  
-	MP4AddH264SequenceParameterSet(hMp4File, videoTrackId, (uint8_t *)spsData, spsLen);
-
-	// write pps  
-	MP4AddH264PictureParameterSet(hMp4File, videoTrackId, (uint8_t *)ppsData, ppsLen);
-
-	//初始化音频解码器
-	write_stream_init(&pRtmpH264->rtmp_PublishObj, audioSample, audiochannel);
-
-	//设置音频解码信息
-	MP4SetTrackESConfiguration(hMp4File, audioTrackId, (uint8_t*)audioConfig, audioConfigLen);
-}
-
-
-void CloseMp4File()
-{
-	MP4Close(hMp4File);
-}
-
-
-long RTMP_CreateMp4File(char* fileName, int audioChannel, int audioSample)
-{
-	int rResult = 0;
-
-	rResult = InitMp4(fileName);
-	if(rResult != 0)
-		return 0;
-
-	if (!pRtmpH264)
-		pRtmpH264 = new RtmpH264();
-
-	pRtmpH264->FreeEncodeParams();
-	pRtmpH264->m_isCreatePublish = true;
-	pRtmpH264->m_type = 1;
-	pRtmpH264->m_audioChannel = audioChannel;
-	pRtmpH264->m_audioSample = audioSample;
-
-	return 1;
-}
-void RTMP_CloseMp4File()
-{
-	if(audioConfig)
-	{
-		delete audioConfig;
-	}
-	audioConfig = NULL;
-
-	if (pRtmpH264)
-	{
-		pRtmpH264->FreeEncodeParams();
-		delete pRtmpH264;
-	}
-	pRtmpH264 = NULL;
-
-
-	CloseMp4File();
-}
-
-//初始化编码器
-long RTMP_WriteVideoParams(unsigned long width, unsigned long height, unsigned long fps, unsigned long bitrate)
-{
-	int nResult = -1;
-	if (!pRtmpH264)
-	{
-		return -1;
-	}
-	nResult = pRtmpH264->WriteVideoParams(width, height, fps, bitrate);
-	return nResult;
-}
-
-//发送截图  对截图进行x264编码
-long RTMP_WriteScreenCapture(char * frame, unsigned long Stride, unsigned long Height, unsigned long timespan)
-{
-	int nResult = -1;
-	if (!pRtmpH264)
-	{
-		return -1;
-	}
-	nResult = pRtmpH264->WriteScreenCapture((BYTE *)frame, Stride, Height, timespan);
-	return nResult;
-}
-
-//发送音频数据  原始数据为PCM
-long RTMP_WriteAudioFrame(char* szBuf, unsigned long nBufLen, unsigned long nSampleRate, unsigned long nChannels, unsigned long timespan)
-{
-	int nResult = -1;
-	if (!pRtmpH264)
-	{
-		return -1;
-	}
-	nResult = RTMPMOD_WriteSendAudio(&pRtmpH264->rtmp_PublishObj, szBuf, nBufLen, nSampleRate, nChannels, timespan);
 	return nResult;
 }
